@@ -1,0 +1,3 @@
+[submodule "l-smash-works"]
+	path = third_party/l-smash-works
+	url = https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git

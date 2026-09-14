@@ -26,6 +26,10 @@
 #include <libavutil/hdr_dynamic_metadata.h>
 #endif
 #if LSMAS_LSW_VARIANT_HOE
+#include <lsmas_ffmpeg_contract.h>
+#if !defined(LSMAS_FFMPEG_MOV_AUDIO_END_FIXED) || LSMAS_FFMPEG_MOV_AUDIO_END_FIXED != 1
+#error HOE builds require the FFmpeg MOV audio end correction
+#endif
 #include <libavutil/channel_layout.h>
 #include <libavutil/frame.h>
 #include <libavcodec/packet.h>
@@ -526,11 +530,7 @@ static int sbuf_append_version_triplet_from_u32( sbuf_t *b, uint32_t v )
 
 LSMAS_NATIVE_API int32_t lsmas_get_api_version( void )
 {
-#if LSMAS_LSW_VARIANT_HOE
     return (int32_t)LSMAS_NATIVE_API_VERSION;
-#else
-    return (int32_t)LSMAS_NATIVE_MAKE_API_VERSION(1, 1, 0);
-#endif
 }
 
 LSMAS_NATIVE_API char *lsmas_get_versions_json_utf8( char **error_message )
@@ -556,7 +556,7 @@ LSMAS_NATIVE_API char *lsmas_get_versions_json_utf8( char **error_message )
 
     if( APPEND_LIT( &b, ",\"api_version_string\":" ) != 0 )
         goto oom;
-    if( sbuf_append_json_escaped( &b, LSMAS_LSW_VARIANT_HOE ? LSMAS_NATIVE_API_VERSION_STRING : "1.1.0" ) != 0 )
+    if( sbuf_append_json_escaped( &b, LSMAS_NATIVE_API_VERSION_STRING ) != 0 )
         goto oom;
 
     if( APPEND_LIT( &b, ",\"zig_version\":" ) != 0 )
@@ -1575,14 +1575,14 @@ static int64_t count_decoded_audio_samples( lsmas_handle_t *h )
 #endif
 }
 
-/* The index counts coded frame samples; libavcodec removes packet-declared
- * encoder priming and trailing padding before exposing decoded frames. Keep
- * the seek index on that same decoded timeline, including cached old indexes. */
+/* The index counts coded frame samples; rendering trims encoder priming and
+ * trailing padding. Keep the seek index on that same decoded timeline,
+ * including cached old indexes. */
 static int trim_audio_index_padding( lsmas_handle_t *h )
 {
 #if LSMAS_LSW_VARIANT_HOE
-#ifndef LSMAS_HOE_AUDIO_READ_CONTRACT
-#error HOE builds require the audio read contract dependency patch
+#if !defined(LSMAS_HOE_AUDIO_READ_CONTRACT) || LSMAS_HOE_AUDIO_READ_CONTRACT < 2
+#error HOE builds require the seek-aware audio read contract dependency patch
 #endif
     lwlibav_audio_decode_handler_t *adhp = h->adhp;
     for( int tail = 0; tail < 2; ++tail )
@@ -1818,7 +1818,7 @@ static int init_audio_provider_on_handle( lsmas_handle_t *h, const lsmas_audio_o
 
     /* Rescale av_gap to output sample rate if needed (match LWLibavAudioSource). */
     if( h->lwh.av_gap && ctx && ctx->sample_rate > 0 && h->aohp->output_sample_rate != ctx->sample_rate )
-        h->lwh.av_gap = ((int64_t)h->lwh.av_gap * h->aohp->output_sample_rate - 1) / ctx->sample_rate + 1;
+        h->lwh.av_gap = av_rescale_rnd( h->lwh.av_gap, h->aohp->output_sample_rate, ctx->sample_rate, AV_ROUND_UP );
 
 
 #if LSMAS_LSW_VARIANT_HOE
@@ -2539,7 +2539,7 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_audio_open_utf8(
 
     /* Rescale av_gap to output sample rate if needed (match LWLibavAudioSource). */
     if( h->lwh.av_gap && ctx && ctx->sample_rate > 0 && h->aohp->output_sample_rate != ctx->sample_rate )
-        h->lwh.av_gap = ((int64_t)h->lwh.av_gap * h->aohp->output_sample_rate - 1) / ctx->sample_rate + 1;
+        h->lwh.av_gap = av_rescale_rnd( h->lwh.av_gap, h->aohp->output_sample_rate, ctx->sample_rate, AV_ROUND_UP );
 
 
 #if LSMAS_LSW_VARIANT_HOE

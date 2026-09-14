@@ -1,6 +1,6 @@
 param(
     [ValidateSet("AkarinVS", "HOE")]
-    [string]$Variant = "AkarinVS",
+    [string]$Variant = "HOE",
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
     [string]$ArtifactsDir = "artifacts",
@@ -33,12 +33,15 @@ $lsmasWorksDir = "build-deps\L-SMASH-Works-AkarinVS"
 $ffmpegPrefix = "build-deps\ffmpeg-lsmas-win64-local-mingw-static"
 
 if ($Variant -eq "HOE") {
-    $ffmpegRepo = "https://github.com/HomeOfAviSynthPlusEvolution/FFmpeg"
-    $ffmpegRef = "custom-patches-for-lsmashsource"
-    $lsmasWorksRepo = "https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git"
-    $lsmasWorksRef = "master"
-    $lsmasWorksDir = "build-deps\L-SMASH-Works-HOE"
-    $ffmpegPrefix = "build-deps\ffmpeg-hoe-win64-local-mingw-static"
+    $buildArgs = @((Join-Path $PSScriptRoot "build_hoe_native.py"), "--configuration", $Configuration,
+        "--jobs", $Jobs, "--out-dir", (Join-Path $ArtifactsDir "native/win-x64-hoe"))
+    if ($SkipFfmpeg) { $buildArgs += "--skip-ffmpeg" }
+    if ($Clean) { $buildArgs += "--rebuild-ffmpeg" }
+    & python @buildArgs
+    if ($LASTEXITCODE -ne 0) { throw "HOE native build failed" }
+    & dotnet build (Join-Path $RepoRoot "LsmasSharp.slnx") -c $Configuration
+    if ($LASTEXITCODE -ne 0) { throw "Managed build failed" }
+    return
 }
 
 $nativeOut = Join-Path $ArtifactsDir "native\win-x64"

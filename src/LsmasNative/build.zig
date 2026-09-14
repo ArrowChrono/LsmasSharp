@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const l_smash_works_dir = b.option([]const u8, "l_smash_works_dir", "L-SMASH-WORKS repo directory (must contain common/)") orelse "";
+    const l_smash_works_dir = b.option([]const u8, "l_smash_works_dir", "L-SMASH-WORKS sources (prepare HOE with scripts/build_hoe_native.py)") orelse "";
     if (l_smash_works_dir.len == 0) {
         std.log.err("Missing L-SMASH-WORKS directory. Pass -Dl_smash_works_dir=...", .{});
         return;
@@ -53,22 +53,7 @@ pub fn build(b: *std.Build) void {
     const is_legacy_lsw = path_exists(io, legacy_xxhash_c);
     const is_hoe_lsw = path_exists(io, hoe_lwindex_utils_c);
 
-    var lsw_root: std.Build.LazyPath = .{ .cwd_relative = l_smash_works_dir };
-    if (is_hoe_lsw and !is_legacy_lsw) {
-        const python = b.option([]const u8, "python", "Python used to prepare the private audio dependency") orelse
-            (if (@import("builtin").os.tag == .windows) "python" else "python3");
-        const prepare = b.addSystemCommand(&.{python});
-        // Directory arguments are not content-hashed by Run. Refresh the private
-        // copy on every build so changing the dependency checkout cannot reuse stale code.
-        prepare.has_side_effects = true;
-        prepare.addFileArg(b.path("../../scripts/prepare_audio_dependency.py"));
-        prepare.addArg("--source");
-        prepare.addDirectoryArg(.{ .cwd_relative = l_smash_works_dir });
-        prepare.addArg("--patch");
-        prepare.addFileArg(b.path("patches/hoe-audio-read-contract.patch"));
-        prepare.addArg("--output");
-        lsw_root = prepare.addOutputDirectoryArg("lsmas-audio-contract");
-    }
+    const lsw_root: std.Build.LazyPath = .{ .cwd_relative = l_smash_works_dir };
     lib.root_module.addIncludePath(lsw_root.path(b, "common"));
 
     if (is_hoe_lsw and !is_legacy_lsw) {

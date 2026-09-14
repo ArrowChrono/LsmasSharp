@@ -1,6 +1,9 @@
 --- a/common/audio_output.c
 +++ b/common/audio_output.c
-@@ -29,14 +29,31 @@
+@@ -25,1 +25,2 @@
+ #include "resample.h"
++#include <libavutil/intreadwrite.h>
+@@ -29,14 +30,31 @@
  {
      /* Input */
      uint8_t* in_data[32];
@@ -35,7 +38,17 @@
      /* Output */
      uint8_t* resampled_buffer = NULL;
      if (aohp->s24_output) {
-@@ -98,7 +115,10 @@
+@@ -84,6 +102,9 @@
+     int output_audio = 0;
+     do {
+         int decode_complete;
++        /* The seek index owns initial padding. A fresh decoder's global skip
++         * must not trim the first output when decoding begins in the middle. */
++        ctx->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+         int consumed_data_length = decode_audio_packet(ctx, frame_buffer, &decode_complete, pkt);
+         if (consumed_data_length < 0) {
+             /* Force to request the next sample. */
+@@ -98,7 +119,10 @@
                  *output_flags |= AUDIO_DECODER_RECEIVED_PACKET;
              }
          } else if (!decode_complete) {
@@ -47,6 +60,17 @@
              *output_flags |= AUDIO_OUTPUT_ENOUGH;
              break;
          }
+@@ -125,6 +149,10 @@
+             }
+             /* Process decoded audio samples. */
+             int decoded_length = frame_buffer->nb_samples;
++            AVFrameSideData* padding = av_frame_get_side_data(frame_buffer, AV_FRAME_DATA_SKIP_SAMPLES);
++            uint32_t discard = padding && padding->size >= 10 ? AV_RL32(padding->data + 4) : 0;
++            if (discard <= (uint32_t)decoded_length)
++                decoded_length -= discard;
+             if (decoded_length > aohp->output_sample_offset) {
+                 /* Send decoded audio data to resampler and get desired resampled audio as you want as much as possible. */
+                 int useful_length = (int)(decoded_length - aohp->output_sample_offset);
 --- a/common/lwlibav_audio.c
 +++ b/common/lwlibav_audio.c
 @@ -24,6 +24,7 @@
@@ -84,19 +108,26 @@
          resampled_sample_count = output_sample_rate == current_sample_rate || pcm_sample_count == 0
              ? pcm_sample_count
              : (pcm_sample_count * output_sample_rate - 1) / current_sample_rate + 1;
-@@ -220,16 +220,46 @@
+@@ -220,24 +220,50 @@
      } while (frame_number <= adhp->frame_count);
      *start_offset = start_frame_pos - current_frame_pos;
      if (*start_offset && current_sample_rate != output_sample_rate)
 -        *start_offset = (*start_offset * current_sample_rate - 1) / output_sample_rate + 1;
 +        *start_offset = (start_frame_pos - prior_sequences_resampled_count) * current_sample_rate / output_sample_rate - input_frame_start;
      if (frame_number > 1) {
--        /* Add pre-roll samples if needed.
--         * The condition is irresponsible. Patches welcome. */
+-        /* Add one physical pre-roll frame for lossy audio.
+-         * Synthetic gap entries have no packet and must not be used as pre-roll. */
          enum AVCodecID codec_id = adhp->exh.entries[frame_list[frame_number].extradata_index].codec_id;
          const AVCodecDescriptor* desc = avcodec_descriptor_get(codec_id);
--        if ((desc->props & AV_CODEC_PROP_LOSSY) && frame_list[frame_number].extradata_index == frame_list[frame_number - 1].extradata_index)
--            *start_offset += (uint64_t)frame_list[--frame_number].length;
+-        if (desc->props & AV_CODEC_PROP_LOSSY) {
+-            uint32_t pre_roll_frame = frame_number - 1;
+-            while (pre_roll_frame > 0 && frame_list[pre_roll_frame].file_offset == -1)
+-                --pre_roll_frame;
+-            if (pre_roll_frame > 0
+-                && frame_list[frame_number].extradata_index == frame_list[pre_roll_frame].extradata_index) {
+-                *start_offset += (uint64_t)frame_list[pre_roll_frame].length;
+-                frame_number = pre_roll_frame;
+-            }
 +        int64_t preroll = adhp->ctx->seek_preroll;
 +        if (codec_id == AV_CODEC_ID_OPUS)
 +            preroll = FFMAX(preroll, av_rescale_rnd(80, current_sample_rate, 1000, AV_ROUND_UP));
@@ -109,13 +140,17 @@
 +        if ((desc->props & AV_CODEC_PROP_LOSSY) || preroll > 0) {
 +            uint64_t consumed = 0;
 +            do {
-+                if (frame_list[frame_number].extradata_index != frame_list[frame_number - 1].extradata_index)
++                uint32_t previous = frame_number - 1;
++                while (previous > 0 && frame_list[previous].file_offset == -1)
++                    --previous;
++                if (previous == 0 || frame_list[frame_number].extradata_index != frame_list[previous].extradata_index)
 +                    break;
-+                int length = frame_list[--frame_number].length;
++                frame_number = previous;
++                int length = frame_list[frame_number].length;
 +                *start_offset += length;
 +                consumed += length;
 +            } while (frame_number > 1 && consumed < (uint64_t)preroll);
-+        }
+         }
      }
      return frame_number;
 +}
@@ -136,7 +171,7 @@
  }
  
  static inline void make_decodable_packet(AVPacket* alt_pkt, AVPacket* pkt)
-@@ -247,6 +277,21 @@
+@@ -255,6 +281,21 @@
          --rap_number;
      if (rap_number == 0)
          rap_number = 1;
@@ -158,7 +193,7 @@
      return rap_number;
  }
  
-@@ -364,6 +409,7 @@
+@@ -372,6 +413,7 @@
              }
              match = 1;
          }
@@ -166,7 +201,7 @@
          ++i;
      }
      return rap_number;
-@@ -408,6 +454,14 @@
+@@ -416,7 +458,19 @@
              aohp->request_length -= silence_length;
              start_frame_pos = 0;
          }
@@ -179,9 +214,36 @@
 +            start_frame_pos = aligned;
 +        }
          frame_number = find_start_audio_frame(adhp, aohp->output_sample_rate, start_frame_pos, &aohp->output_sample_offset);
++        /* libavcodec returns untrimmed frames in manual-skip mode. Only the
++         * first indexed frame contains the stream's initial encoder padding. */
++        if (frame_number == 1)
++            aohp->output_sample_offset += adhp->initial_padding;
  retry_seek:
          av_packet_unref(pkt);
-@@ -451,6 +505,7 @@
+         /* Flush audio resampler buffers. */
+@@ -439,6 +493,21 @@
+             lwlibav_flush_buffers((lwlibav_decode_handler_t*)adhp);
+         if (adhp->error)
+             return 0;
++        /* AAC flush preserves window history, which changes a retained first
++         * packet after rewinding. Restore decoder initialization at the start. */
++        if (frame_number == 1 && adhp->ctx->codec_id == AV_CODEC_ID_AAC && adhp->ctx->frame_num > 0) {
++            AVCodecContext* fresh = NULL;
++            if (open_decoder(&fresh, adhp->format->streams[adhp->stream_index]->codecpar,
++                    adhp->ctx->codec, adhp->ctx->thread_count, adhp->drc, adhp->ff_options, NULL, NULL) < 0) {
++                adhp->error = 1;
++                lw_log_show(&adhp->lh, LW_LOG_FATAL, "Failed to reset the audio decoder at the stream start.");
++                return 0;
++            }
++            fresh->opaque = adhp->ctx->opaque;
++            fresh->get_buffer2 = adhp->ctx->get_buffer2;
++            avcodec_free_context(&adhp->ctx);
++            adhp->ctx = fresh;
++        }
+         /* Seek and get a audio packet. */
+         rap_number
+             = seek_audio(adhp, frame_number, past_rap_number, pkt, output_flags != AUDIO_OUTPUT_NO_FLAGS ? adhp->frame_buffer : NULL);
+@@ -459,6 +528,7 @@
          } else if (alter_pkt->size <= 0) {
              /* Getting an audio packet must be after flushing all remaining samples in resampler's FIFO buffer. */
              lwlibav_get_av_frame(adhp->format, adhp->stream_index, frame_number, pkt);
@@ -195,7 +257,7 @@
  
  #ifndef LWLIBAV_AUDIO_INTERNAL_H
  #define LWLIBAV_AUDIO_INTERNAL_H
-+#define LSMAS_HOE_AUDIO_READ_CONTRACT 1
++#define LSMAS_HOE_AUDIO_READ_CONTRACT 2
  
  #include "lwlibav_dec.h"
  

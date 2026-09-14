@@ -5,11 +5,15 @@ on:
   push:
     paths:
       - .github/workflows/hoe-win64.yml
+      - .gitmodules
+      - third_party/l-smash-works
       - scripts/**
       - src/LsmasNative/**
   pull_request:
     paths:
       - .github/workflows/hoe-win64.yml
+      - .gitmodules
+      - third_party/l-smash-works
       - scripts/**
       - src/LsmasNative/**
 
@@ -19,128 +23,34 @@ permissions:
 jobs:
   build:
     name: build static win64 hoe
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    env:
-      VARIANT: hoe
-      FFMPEG_REPO: https://github.com/HomeOfAviSynthPlusEvolution/FFmpeg
-      FFMPEG_REF: custom-patches-for-lsmashsource
-      FFMPEG_COMMIT: 39c24f36247f370864ce86ebdf2aa936151f4bfc
-      LSMASHWORKS_REPO: https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git
-      LSMASHWORKS_REF: master
-      LSMASHWORKS_COMMIT: a83318210c183c8ebbe703d975ffc76fb499ef07
-      FFMPEG_PREFIX: build-deps/ffmpeg-hoe-win64-local-mingw-static
-      FFMPEG_BUILDROOT: build-deps/_wsl/ffmpeg-lsmas-build-local-mingw
-      LSMASHWORKS_DIR: build-deps/L-SMASH-Works-HOE
-      OUT_DIR: artifacts/native/win-x64-hoe
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
-      - name: Checkout
+      - name: Checkout pinned native sources
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          submodules: recursive
 
-      - name: Setup Zig
+      - name: Resolve shared build inputs
+        run: python3 scripts/build_hoe_native.py --github-env >> "$GITHUB_ENV"
+
+      - name: Setup pinned Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: ${{ env.ZIG_VERSION }}
 
-      - name: Cache Zig
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/zig
-            src/LsmasNative/.zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('src/LsmasNative/build.zig', 'src/LsmasNative/*.c', 'src/LsmasNative/*.h') }}
-          restore-keys: |
-            zig-${{ runner.os }}-
-
-      - name: Cache MinGW toolchain
-        uses: actions/cache@v6
-        with:
-          path: build-deps/_wsl/ffmpeg-lsmas-toolchain-local-mingw
-          key: mingw-toolchain-${{ runner.os }}-${{ hashFiles('scripts/build_ffmpeg_lsmas_win64_local_mingw_static.sh') }}
-          restore-keys: |
-            mingw-toolchain-${{ runner.os }}-
+      - name: Test build identity validation
+        run: python3 scripts/test_native_build.py
 
       - name: Cache FFmpeg prefix
-        id: ffmpeg-cache
         uses: actions/cache@v6
         with:
-          path: |
-            ${{ env.FFMPEG_PREFIX }}
-            ${{ env.FFMPEG_BUILDROOT }}
-          key: ffmpeg-static-${{ env.VARIANT }}-${{ runner.os }}-${{ env.FFMPEG_COMMIT }}-${{ hashFiles('scripts/build_ffmpeg_lsmas_win64_local_mingw_static.sh') }}
-          restore-keys: |
-            ffmpeg-static-${{ env.VARIANT }}-${{ runner.os }}-${{ env.FFMPEG_COMMIT }}-
+          path: ${{ env.FFMPEG_PREFIX }}
+          key: ffmpeg-hoe-ubuntu24-${{ env.FFMPEG_BUILD_KEY }}
 
-      - name: Build FFmpeg prefix
-        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/build_ffmpeg_lsmas_win64_local_mingw_static.sh \
-            "$FFMPEG_PREFIX" \
-            "$(nproc)" \
-            0 \
-            "$FFMPEG_REPO" \
-            "$FFMPEG_COMMIT"
-
-      - name: Pin FFmpeg metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$FFMPEG_REPO" > "$FFMPEG_PREFIX/lsmas-remote.txt"
-          printf '%s\n' "$FFMPEG_REF" > "$FFMPEG_PREFIX/lsmas-branch.txt"
-          printf '%s\n' "$FFMPEG_COMMIT" > "$FFMPEG_PREFIX/lsmas-commit.txt"
-          printf '%s\n' "$FFMPEG_COMMIT" | cut -c1-12 > "$FFMPEG_PREFIX/lsmas-commit-short.txt"
-
-      - name: Cache L-SMASH-Works checkout
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.LSMASHWORKS_DIR }}
-          key: lsmashworks-${{ env.VARIANT }}-${{ runner.os }}-${{ env.LSMASHWORKS_COMMIT }}
-          restore-keys: |
-            lsmashworks-${{ env.VARIANT }}-${{ runner.os }}-${{ env.LSMASHWORKS_COMMIT }}-
-
-      - name: Build lsmasnative
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/build_lsmasnative_win64_zig.sh \
-            --lsmas-works-dir "$LSMASHWORKS_DIR" \
-            --lsmas-works-repo "$LSMASHWORKS_REPO" \
-            --lsmas-works-ref "$LSMASHWORKS_COMMIT" \
-            --lsmas-works-ref-label "$LSMASHWORKS_REF" \
-            --ffmpeg-prefix "$FFMPEG_PREFIX" \
-            --out-dir "$OUT_DIR" \
-            --release
-
-      - name: Write build manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "variant=$VARIANT"
-            echo "zig_version=$(zig version)"
-            echo "ffmpeg_repo=$FFMPEG_REPO"
-            echo "ffmpeg_ref=$FFMPEG_REF"
-            echo "ffmpeg_commit=$FFMPEG_COMMIT"
-            echo "lsmashworks_repo=$LSMASHWORKS_REPO"
-            echo "lsmashworks_ref=$LSMASHWORKS_REF"
-            echo "lsmashworks_commit=$LSMASHWORKS_COMMIT"
-          } > "$OUT_DIR/build-manifest.txt"
-
-      - name: Verify single DLL output
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f "$OUT_DIR/lsmasnative.dll"
-          test -f "$OUT_DIR/lsmasnative.pdb"
-          dll_count="$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.dll' | wc -l)"
-          test "$dll_count" -eq 1
-          ls -la "$OUT_DIR"
+      - name: Build with the shared local entry point
+        run: python3 scripts/build_hoe_native.py
 
       - name: Upload lsmasnative artifact
         uses: actions/upload-artifact@v7
@@ -149,5 +59,36 @@ jobs:
           path: |
             ${{ env.OUT_DIR }}/lsmasnative.dll
             ${{ env.OUT_DIR }}/lsmasnative.pdb
-            ${{ env.OUT_DIR }}/build-manifest.txt
+            ${{ env.OUT_DIR }}/build-manifest.json
           if-no-files-found: error
+
+  audio-regression:
+    name: verify Windows audio reads
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          name: lsmasnative-win64-hoe
+          path: artifacts/native/win-x64-hoe
+      - name: Install media fixture tools
+        run: choco install ffmpeg --no-progress -y
+      - name: Verify fresh seeks, timeline offsets and complete reads
+        run: |
+          New-Item -ItemType Directory -Force artifacts/native-audio-tests | Out-Null
+          python scripts/test_native_audio_reads.py --native-library artifacts/native/win-x64-hoe/lsmasnative.dll *> artifacts/native-audio-tests/regression.log
+          $nativeResult = $LASTEXITCODE
+          Get-Content artifacts/native-audio-tests/regression.log
+          exit $nativeResult
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-audio-regression
+          path: artifacts/native-audio-tests
+          if-no-files-found: ignore

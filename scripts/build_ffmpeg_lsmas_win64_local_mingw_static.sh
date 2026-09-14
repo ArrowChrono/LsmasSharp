@@ -66,6 +66,11 @@ fi
 
 # Keep build artifacts/toolchain under the target prefix drive so they persist across WSL sessions.
 WORKROOT="$(dirname "$PREFIX")/_wsl"
+if [ -n "${LSMAS_FFMPEG_SOURCE:-}" ]; then
+  # A private Linux filesystem build also avoids slow WSL compilation on NTFS.
+  WORKROOT="$(mktemp -d -t lsmas-hoe-build.XXXXXXXX)"
+  trap 'rm -rf -- "$WORKROOT"' EXIT
+fi
 BUILDROOT="$WORKROOT/ffmpeg-lsmas-build-local-mingw"
 TOOLROOT="$WORKROOT/ffmpeg-lsmas-toolchain-local-mingw"
 
@@ -272,7 +277,7 @@ build_lsmash() {
 }
 
 build_dav1d() {
-  local ver="1.5.3"
+  local ver="${LSMAS_DAV1D_VERSION:-1.5.3}"
   if [ -f "$PREFIX/dav1d-version.txt" ] && [ "$(cat "$PREFIX/dav1d-version.txt" 2>/dev/null || true)" = "$ver" ] && [ -f "$DEPSROOT/lib/pkgconfig/dav1d.pc" ]; then
     return 0
   fi
@@ -325,7 +330,7 @@ EOF
 }
 
 build_zlib() {
-  local ver="1.3.1"
+  local ver="${LSMAS_ZLIB_VERSION:-1.3.1}"
   if [ -f "$PREFIX/zlib-version.txt" ] && [ "$(cat "$PREFIX/zlib-version.txt" 2>/dev/null || true)" = "$ver" ] && [ -f "$DEPSROOT/lib/libz.a" ] && [ -f "$DEPSROOT/include/zlib.h" ]; then
     return 0
   fi
@@ -357,6 +362,14 @@ build_zlib() {
 }
 
 cd "$BUILDROOT"
+if [ -n "${LSMAS_FFMPEG_SOURCE:-}" ]; then
+  # The checked-out submodule stays read-only. Apply maintained patches only to
+  # this disposable source copy, before any configure or compile step.
+  git -c core.autocrlf=false clone --no-hardlinks "$LSMAS_FFMPEG_SOURCE" FFmpeg
+  git -C FFmpeg checkout --detach "$REF_NAME"
+  git -C FFmpeg apply --check "$LSMAS_FFMPEG_PATCH"
+  git -C FFmpeg apply "$LSMAS_FFMPEG_PATCH"
+else
 if [ ! -d FFmpeg/.git ]; then
   rm -rf FFmpeg
   git -c init.defaultBranch=ci init FFmpeg
@@ -372,6 +385,8 @@ if [ -n "${FFMPEG_RESOLVED_COMMIT:-}" ]; then
 fi
 fetch_git_ref "." "$fetch_ref" || fetch_git_ref "." "$REF_NAME"
 git checkout -f FETCH_HEAD
+fi
+cd "$BUILDROOT/FFmpeg"
 git rev-parse HEAD > "$PREFIX/lsmas-commit.txt"
 git rev-parse --short=12 HEAD > "$PREFIX/lsmas-commit-short.txt"
 git config --get remote.origin.url > "$PREFIX/lsmas-remote.txt" || true

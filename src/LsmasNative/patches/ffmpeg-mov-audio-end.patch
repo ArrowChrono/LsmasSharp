@@ -1,0 +1,63 @@
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -11630,6 +11630,14 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
+ {
+     MOVContext *mov = s->priv_data;
+     MOVStreamContext *sc = st->priv_data;
++    int64_t audio_end = AV_NOPTS_VALUE;
++
++    /* duration is a length, whereas packet timestamps and discard boundaries
++     * use the stream's absolute timeline. Do not infer an unrepresentable end. */
++    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !mov->fragment.found_tfhd &&
++        st->start_time != AV_NOPTS_VALUE && st->duration > 0 &&
++        st->start_time <= INT64_MAX - st->duration)
++        audio_end = st->start_time + st->duration;
+ 
+     pkt->stream_index = sc->ffindex;
+     pkt->dts = sample->timestamp;
+@@ -11641,7 +11649,8 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
+     } else {
+         if (pkt->duration == 0) {
+             int64_t next_dts = (sc->current_sample < ffstream(st)->nb_index_entries) ?
+-                ffstream(st)->index_entries[sc->current_sample].timestamp : st->duration;
++                ffstream(st)->index_entries[sc->current_sample].timestamp :
++                audio_end != AV_NOPTS_VALUE ? audio_end : st->duration;
+             if (next_dts >= pkt->dts)
+-                pkt->duration = next_dts - pkt->dts;
++                pkt->duration = av_sat_sub64(next_dts, pkt->dts);
+         }
+@@ -11649,19 +11658,21 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
+     }
+ 
+     if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !mov->fragment.found_tfhd &&
+-        sc->current_sample >= ffstream(st)->nb_index_entries) {
+-        int64_t pts   = av_rescale_q(pkt->pts,     st->time_base, (AVRational){ 1, st->codecpar->sample_rate });
+-        int64_t total = av_rescale_q(st->duration, st->time_base, (AVRational){ 1, st->codecpar->sample_rate });
+-        int64_t duration = pkt->duration;
++        sc->current_sample >= ffstream(st)->nb_index_entries &&
++        audio_end != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE &&
++        pkt->duration > 0 && st->codecpar->sample_rate > 0) {
++        AVRational sample_time_base = { 1, st->codecpar->sample_rate };
++        int64_t packet_end = FFMIN(av_sat_add64(pkt->pts, pkt->duration), audio_end);
++        int64_t first_discard = av_rescale_q(packet_end, st->time_base, sample_time_base);
++        int64_t last_discard  = av_rescale_q(audio_end,  st->time_base, sample_time_base);
+ 
+-        if (av_sat_add64(pkt->pts, pkt->duration) > st->duration)
+-            duration = st->duration - pkt->pts;
+-        duration = av_rescale_q(duration, st->time_base, (AVRational){ 1, st->codecpar->sample_rate });
+-
+-        if (!ffstream(st)->first_discard_sample)
+-            ffstream(st)->first_discard_sample = av_sat_add64(pts, duration);
+-        if (!ffstream(st)->last_discard_sample)
+-            ffstream(st)->last_discard_sample  = total;
++        /* av_rescale_q returns INT64_MIN if the sample position overflows. */
++        if (first_discard != INT64_MIN && last_discard != INT64_MIN) {
++            if (!ffstream(st)->first_discard_sample)
++                ffstream(st)->first_discard_sample = first_discard;
++            if (!ffstream(st)->last_discard_sample)
++                ffstream(st)->last_discard_sample = last_discard;
++        }
+     }
+ 
+     if (sc->tts_data && sc->tts_index < sc->tts_count) {

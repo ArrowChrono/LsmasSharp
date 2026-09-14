@@ -4,6 +4,7 @@ import argparse
 import ctypes as c
 import pathlib
 import json
+import math
 import shutil
 import struct
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 import unittest
 import wave
 from contextlib import contextmanager
+from fractions import Fraction
 
 
 class Options(c.Structure):
@@ -103,9 +105,9 @@ class NativeAudioReadTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(expected, actual)
 
-    def test_audio_contract_metadata_agrees_with_api_version(self):
+    def test_api_version_metadata_matches_the_exported_abi(self):
         version = self.native.lsmas_get_api_version()
-        self.assertGreaterEqual(version, 0x010101)
+        self.assertEqual(0x010100, version)
         self.native.lsmas_get_versions_json_utf8.argtypes = [c.POINTER(c.c_void_p)]
         self.native.lsmas_get_versions_json_utf8.restype = c.c_void_p
         error = c.c_void_p()
@@ -228,9 +230,57 @@ class NativeAudioReadTests(unittest.TestCase):
         subprocess.run([
             ARGS.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", f"sine=frequency=997:sample_rate=44100:duration={duration}",
-            "-ac", "2", "-c:a", codec, str(path),
+            "-ac", "2", "-c:a", codec,
+            *(["-aac_pns", "0"] if codec == "aac" else []), str(path),
         ], check=True, timeout=10)
         return path
+
+    def audio_stream(self, media):
+        result = subprocess.run([
+            ARGS.ffprobe, "-v", "error", "-select_streams", "a:0", "-show_streams",
+            "-of", "json", str(media),
+        ], check=True, capture_output=True, timeout=10)
+        return json.loads(result.stdout)["streams"][0]
+
+    def valid_codec_frames(self, media, codec, duration, native_rate):
+        if codec in ("aac", "libopus"):
+            stream = self.audio_stream(media)
+            frames = round(Fraction(stream["duration_ts"]) * Fraction(stream["time_base"]) * native_rate)
+            if codec == "libopus":
+                data = media.read_bytes()
+                header = data.index(b"OpusHead")
+                # Ogg's final granule includes the initial Opus pre-skip.
+                frames -= struct.unpack_from("<H", data, header + 10)[0]
+            return frames
+        # The generated PCM length, and MP3's gapless length, are independent
+        # of how an installed FFmpeg decoder handles a final partial AAC packet.
+        return round(Fraction(duration) * 44100)
+
+    def checked_samples(self, handle, start, count, channels=1):
+        result, samples, error = self.read(handle, start, count, channels)
+        self.assertEqual(count, result, error)
+        self.assertIsNone(error)
+        self.assertNotIn(-23456, samples, "A low-amplitude fixture must overwrite every output sample")
+        return samples
+
+    def assert_signal_preserved(self, expected, actual, sample_rate, channels=1):
+        self.assertEqual(len(expected), len(actual))
+        frames = len(expected) // channels
+        window = math.ceil(Fraction(2 * sample_rate, 997))
+        for offset in range(0, frames, window):
+            # Anchor the last window at EOF: a valid prefix must not hide a
+            # decoder shortfall replaced by a silent suffix. Respect genuine
+            # padding whenever the full decode has no signal in that window.
+            start = min(offset, max(0, frames - window))
+            end = min(start + window, frames)
+            for channel in range(channels):
+                reference = expected[start * channels + channel:end * channels:channels]
+                samples = actual[start * channels + channel:end * channels:channels]
+                with self.subTest(window_start=start, channel=channel):
+                    if any(value > 0 for value in reference):
+                        self.assertTrue(any(value > 0 for value in samples), "Positive tone samples were lost")
+                    if any(value < 0 for value in reference):
+                        self.assertTrue(any(value < 0 for value in samples), "Negative tone samples were lost")
 
     def ffmpeg_samples(self, media, sample_rate, internal_float=False):
         result = subprocess.run([
@@ -251,8 +301,8 @@ class NativeAudioReadTests(unittest.TestCase):
                 media = self.generated_codec_media(codec, extension, duration)
                 for rate in dict.fromkeys((native_rate, 32000, 48000)):
                     with self.subTest(codec=codec, duration=duration, rate=rate):
-                        reference = self.ffmpeg_samples(media, rate)
-                        count = len(reference) // 2
+                        native_frames = self.valid_codec_frames(media, codec, duration, native_rate)
+                        count = math.ceil(Fraction(native_frames * rate, native_rate))
                         with self.opened(media, sample_rate=rate, expected_format=(rate, 2, 2)) as (handle, info):
                             self.assertEqual(count, info.total_samples)
                             self.assertEqual(count, info.decoded_samples)
@@ -282,7 +332,40 @@ class NativeAudioReadTests(unittest.TestCase):
                                 got, samples, error = self.read(handle, start, length, 2)
                                 self.assertEqual(length, got, error)
                                 sequential.extend(samples)
-                            self.assertEqual(whole, sequential)
+                            self.assert_samples_equal(whole, sequential)
+
+    def test_fresh_aac_and_opus_middle_and_near_eof_reads_recover_to_head(self):
+        for codec, extension, native_rate in [("aac", "m4a", 44100), ("libopus", "opus", 48000)]:
+            media = self.generated_codec_media(codec, extension, "1.013")
+            native_frames = self.valid_codec_frames(media, codec, "1.013", native_rate)
+            for requested_rate in (0, 32000, 44100):
+                rate = requested_rate or native_rate
+                count = math.ceil(Fraction(native_frames * rate, native_rate))
+                with self.opened(media, sample_rate=requested_rate, expected_format=(rate, 2, 2)) as (handle, info):
+                    self.assertEqual(count, info.total_samples)
+                    reference = self.checked_samples(handle, 0, count, 2)
+                for start in (count // 2, count - 137):
+                    with self.subTest(codec=codec, requested_rate=requested_rate, first_start=start):
+                        # Nothing is read on this handle before the first seek.
+                        with self.opened(media, sample_rate=requested_rate, expected_format=(rate, 2, 2)) as (handle, info):
+                            self.assertEqual(count, info.total_samples)
+                            actual = self.checked_samples(handle, start, count - start, 2)
+                            if codec == "aac":
+                                # PNS is disabled when encoding this fixture;
+                                # all requested samples must match, not just its tone.
+                                self.assert_samples_equal(reference[start * 2:], actual)
+                            else:
+                                self.assert_signal_preserved(reference[start * 2:], actual, rate, 2)
+                            self.assertEqual([0] * 34, self.checked_samples(handle, count, 17, 2))
+                            self.checked_samples(handle, 0, 128, 2)
+                            recovered = self.checked_samples(handle, 0, count, 2)
+                            self.assert_samples_equal(reference, recovered)
+                            tail = self.checked_samples(handle, count - 137, 154, 2)
+                            if codec == "aac":
+                                self.assert_samples_equal(reference[-274:], tail[:274])
+                            else:
+                                self.assert_signal_preserved(reference[-274:], tail[:274], rate, 2)
+                            self.assertEqual([0] * 34, tail[274:])
 
     def test_resampled_lossless_random_reads_match_whole_decode(self):
         for codec, extension in [("pcm_s16le", "wav"), ("flac", "flac")]:
@@ -297,6 +380,10 @@ class NativeAudioReadTests(unittest.TestCase):
                             result, samples, error = self.read(handle, start, count, 2)
                             self.assertEqual(count, result, error)
                             self.assertEqual(whole[start * 2:(start + count) * 2], samples)
+                    for start in (len(whole) // 4, len(whole) // 2 - 137):
+                        with self.opened(media, sample_rate=rate, expected_format=(rate, 2, 2)) as (handle, info):
+                            samples = self.checked_samples(handle, start, info.total_samples - start, 2)
+                            self.assert_samples_equal(whole[start * 2:], samples)
 
     def test_resampled_truncated_tail_is_not_replaced_by_filter_padding(self):
         media = self.directory / "resampled-truncated.wav"
@@ -331,25 +418,85 @@ class NativeAudioReadTests(unittest.TestCase):
                     ARGS.ffprobe, "-v", "error", "-show_streams", "-of", "json", str(media),
                 ], check=True, capture_output=True, timeout=10)
                 streams = json.loads(metadata.stdout)["streams"]
-                starts = {stream["codec_type"]: float(stream["start_time"]) for stream in streams}
+                starts = {stream["codec_type"]: Fraction(stream["start_pts"]) * Fraction(stream["time_base"])
+                          for stream in streams}
                 # The muxer's edit list decides the actual starts. In particular,
                 # positive AAC offsets may retain the coded priming packet.
-                expected_delay = round((starts["audio"] - starts["video"]) * 48000)
-                with self.opened(media, av_sync=0) as (handle, unshifted):
-                    result, original, error = self.read(handle, 0, unshifted.total_samples)
-                    self.assertEqual(unshifted.total_samples, result, error)
-                    self.assertEqual(0, unshifted.delay_samples)
-                with self.opened(media) as (handle, info):
-                    self.assertEqual(expected_delay, info.delay_samples)
-                    self.assertEqual(unshifted.decoded_samples, info.decoded_samples)
-                    self.assertEqual(info.decoded_samples + expected_delay, info.total_samples)
-                    result, actual, error = self.read(handle, 0, info.total_samples)
-                    self.assertEqual(info.total_samples, result, error)
-                    if expected_delay == 0:
-                        self.assert_samples_equal(original, actual)
-                    if expected_delay > 0:
-                        self.assertEqual([0] * expected_delay, actual[:expected_delay])
-                        self.assert_samples_equal(original, actual[expected_delay:])
+                audio = next(stream for stream in streams if stream["codec_type"] == "audio")
+                valid_frames = round(Fraction(audio["duration_ts"]) * Fraction(audio["time_base"]) * 48000)
+                for requested_rate in (0, 32000, 44100):
+                    rate = requested_rate or 48000
+                    expected_delay = math.ceil((starts["audio"] - starts["video"]) * rate)
+                    expected_frames = math.ceil(Fraction(valid_frames * rate, 48000))
+                    with self.subTest(rate=rate, delay=expected_delay):
+                        with self.opened(media, av_sync=0, sample_rate=requested_rate,
+                                         expected_format=(rate, 1, 2)) as (handle, unshifted):
+                            self.assertEqual(expected_frames, unshifted.total_samples)
+                            self.assertEqual(0, unshifted.delay_samples)
+                            original = self.checked_samples(handle, 0, unshifted.total_samples)
+                        with self.opened(media, sample_rate=requested_rate,
+                                         expected_format=(rate, 1, 2)) as (handle, info):
+                            self.assertEqual(expected_delay, info.delay_samples)
+                            self.assertEqual(expected_frames, info.decoded_samples)
+                            self.assertEqual(expected_frames + expected_delay, info.total_samples)
+                            # The first full read catches negative-offset priming;
+                            # positive MOV reads also exercise the constructor's
+                            # tail probe followed by rewind from demuxer EOF.
+                            actual = self.checked_samples(handle, 0, info.total_samples)
+                            expected = ([0] * expected_delay + original if expected_delay >= 0
+                                        else original[-expected_delay:])
+                            self.assert_samples_equal(expected, actual)
+                            self.assertEqual([0] * 17, self.checked_samples(handle, info.total_samples, 17))
+                            self.checked_samples(handle, info.total_samples - 137, 137)
+                            self.assert_samples_equal(expected, self.checked_samples(handle, 0, info.total_samples))
+                        with self.opened(media, sample_rate=requested_rate,
+                                         expected_format=(rate, 1, 2)) as (handle, info):
+                            tail = self.checked_samples(handle, info.total_samples - 137, 154)
+                            self.assert_signal_preserved(expected[-137:], tail[:137], rate)
+                            self.assertEqual([0] * 17, tail[137:])
+
+    def test_internal_timestamp_gap_keeps_existing_contiguous_pcm_timeline(self):
+        # Native does not expose AviSynth's fill_agaps option. Its default
+        # timeline contains the decoded packets, without adding synthetic silence.
+        frames, gap_start, gap_end = 192000, 48 * 1024, 72 * 1024
+        source_samples = [1000 + (index * 7) % 2047 for index in range(frames)]
+        expected = source_samples[:gap_start] + source_samples[gap_end:]
+        source = self.directory / "gap-source.wav"
+        compact = self.directory / "gap-compacted.wav"
+        for path, samples in [(source, source_samples), (compact, expected)]:
+            with wave.open(str(path), "wb") as stream:
+                stream.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+                stream.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+        media = self.directory / "internal-gap.mkv"
+        subprocess.run([
+            ARGS.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+            "-af", "asetnsamples=n=1024:p=0,aselect=not(between(n\\,48\\,71))",
+            "-c:a", "pcm_s16le", str(media),
+        ], check=True, timeout=10)
+        packet_result = subprocess.run([
+            ARGS.ffprobe, "-v", "error", "-show_packets", "-of", "json", str(media),
+        ], check=True, capture_output=True, timeout=10)
+        packets = json.loads(packet_result.stdout)["packets"]
+        gaps = [Fraction(right["pts_time"]) - Fraction(left["pts_time"]) - Fraction(left["duration_time"])
+                for left, right in zip(packets, packets[1:])]
+        self.assertEqual(1, sum(gap > Fraction(1, 2) for gap in gaps))
+        for requested_rate in (0, 32000, 44100):
+            rate = requested_rate or 48000
+            # PCM-only FFmpeg resampling is independent of MOV edit lists,
+            # codec priming, and the compressed decoder under test.
+            reference = expected if rate == 48000 else self.ffmpeg_samples(compact, rate, internal_float=True)
+            with self.subTest(rate=rate):
+                with self.opened(media, av_sync=0, sample_rate=requested_rate,
+                                 expected_format=(rate, 1, 2)) as (handle, info):
+                    self.assertEqual(len(reference), info.total_samples)
+                    self.assertEqual(0, info.delay_samples)
+                    whole = self.checked_samples(handle, 0, info.total_samples)
+                    self.assert_samples_equal(reference, whole)
+                boundary = gap_start * rate // 48000
+                for start in (boundary - 128, boundary, boundary + 128):
+                    with self.opened(media, av_sync=0, sample_rate=requested_rate,
+                                     expected_format=(rate, 1, 2)) as (handle, _):
+                        self.assert_samples_equal(reference[start:start + 256], self.checked_samples(handle, start, 256))
 
     def test_strong_downsampling_counts_and_returns_the_full_eof(self):
         for frames in (264, 192000):
