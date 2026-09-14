@@ -15,7 +15,7 @@
 
 #define LSMAS_NATIVE_API_VERSION_MAJOR 1
 #define LSMAS_NATIVE_API_VERSION_MINOR 1
-#define LSMAS_NATIVE_API_VERSION_PATCH 0
+#define LSMAS_NATIVE_API_VERSION_PATCH 1
 #define LSMAS_NATIVE_MAKE_API_VERSION(major, minor, patch) (((major) << 16) | ((minor) << 8) | (patch))
 #define LSMAS_NATIVE_API_VERSION LSMAS_NATIVE_MAKE_API_VERSION( \
     LSMAS_NATIVE_API_VERSION_MAJOR, \
@@ -610,7 +610,13 @@ LSMAS_NATIVE_API int lsmas_audio_get_info(
 );
 
 /* Reads interleaved PCM samples in the configured output format.
- * Returns the number of sample-frames written (not bytes). */
+ * HOE API 1.1.1 excludes declared codec padding from the indexed timeline and
+ * includes the actual resampler EOF output. Legacy builds report API 1.1.0.
+ * Returns the number of sample-frames written (not bytes), or -1 on failure.
+ * Requests before/after the output timeline and positive A/V delay padding are
+ * filled with silence and count as successful output. An incomplete decode
+ * inside the timeline fails the entire request; discard dst and retry the full
+ * range if appropriate. error_message is allocated with lsmas_free ownership. */
 LSMAS_NATIVE_API int64_t lsmas_audio_get_samples(
     lsmas_handle_t *handle,
     void *dst,

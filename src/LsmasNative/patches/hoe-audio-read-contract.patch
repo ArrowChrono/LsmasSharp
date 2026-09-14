@@ -1,0 +1,228 @@
+--- a/common/audio_output.c
++++ b/common/audio_output.c
+@@ -29,14 +29,31 @@
+ {
+     /* Input */
+     uint8_t* in_data[32];
+-    int decoded_data_offset = sample_offset * aohp->input_block_align;
++    int decoded_data_offset = sample_offset > 0 ? sample_offset * aohp->input_block_align : 0;
+     for (int i = 0; i < aohp->input_planes; i++)
+-        in_data[i] = frame->extended_data[i] + decoded_data_offset;
++        in_data[i] = sample_offset < 0 ? NULL : frame->extended_data[i] + decoded_data_offset;
+     audio_samples_t in;
+     in.channel_layout = frame->ch_layout.u.mask;
+     in.sample_count = input_sample_count;
+     in.sample_format = (enum AVSampleFormat)frame->format;
+-    in.data = in_data;
++    in.data = sample_offset < 0 ? NULL : in_data;
++    /* Discard seek preroll after resampling, retaining the global sample phase. */
++    if (aohp->skip_decoded_samples) {
++        uint8_t* scratch = av_malloc((size_t)4096 * aohp->output_block_align);
++        if (!scratch)
++            return 0;
++        while (aohp->skip_decoded_samples) {
++            int request = (int)FFMIN(aohp->skip_decoded_samples, 4096);
++            int dropped = swr_convert(aohp->swr_ctx, &scratch, request, (const uint8_t**)in.data, in.sample_count);
++            in.sample_count = 0;
++            if (dropped <= 0) {
++                av_free(scratch);
++                return 0;
++            }
++            aohp->skip_decoded_samples -= dropped;
++        }
++        av_free(scratch);
++    }
+     /* Output */
+     uint8_t* resampled_buffer = NULL;
+     if (aohp->s24_output) {
+@@ -98,7 +115,10 @@
+                 *output_flags |= AUDIO_DECODER_RECEIVED_PACKET;
+             }
+         } else if (!decode_complete) {
+-            /* No more PCM audio samples in this stream. */
++            /* Drain the resampler after the decoder reaches EOF. */
++            int drained = consume_decoded_audio_samples(aohp, frame_buffer, 0, (int)aohp->request_length, output_buffer, -1);
++            output_length += drained;
++            aohp->request_length -= drained;
+             *output_flags |= AUDIO_OUTPUT_ENOUGH;
+             break;
+         }
+--- a/common/lwlibav_audio.c
++++ b/common/lwlibav_audio.c
+@@ -24,6 +24,7 @@
+ #include "cpp_compat.h"
+ #include "decode.h"
+ #include "resample.h"
++#include <libavutil/intreadwrite.h>
+ 
+ /*****************************************************************************
+  * Allocators / Deallocators
+@@ -195,21 +196,20 @@
+     uint64_t current_frame_pos = 0;
+     uint64_t next_frame_pos = 0;
+     int current_sample_rate = frame_list[frame_number].sample_rate > 0 ? frame_list[frame_number].sample_rate : adhp->ctx->sample_rate;
+-    int current_frame_length = frame_list[frame_number].length;
+     uint64_t resampled_sample_count = 0; /* the number of accumulated PCM samples after resampling per sequence */
+     uint64_t pcm_sample_count = 0; /* the number of accumulated PCM samples before resampling per sequence */
++    uint64_t input_frame_start = 0;
+     uint64_t prior_sequences_resampled_count = 0; /* the number of accumulated PCM samples of all prior sequences */
+     do {
+         current_frame_pos = next_frame_pos;
+-        if ((current_sample_rate != frame_list[frame_number].sample_rate && frame_list[frame_number].sample_rate > 0)
+-            || current_frame_length != frame_list[frame_number].length) {
++        if (current_sample_rate != frame_list[frame_number].sample_rate && frame_list[frame_number].sample_rate > 0) {
+             /* Encountered a new sequence. */
+             prior_sequences_resampled_count += resampled_sample_count;
+             pcm_sample_count = 0;
+             current_sample_rate = frame_list[frame_number].sample_rate > 0 ? frame_list[frame_number].sample_rate : adhp->ctx->sample_rate;
+-            current_frame_length = frame_list[frame_number].length;
+-        }
+-        pcm_sample_count += (uint64_t)current_frame_length;
++        }
++        input_frame_start = pcm_sample_count;
++        pcm_sample_count += (uint64_t)frame_list[frame_number].length;
+         resampled_sample_count = output_sample_rate == current_sample_rate || pcm_sample_count == 0
+             ? pcm_sample_count
+             : (pcm_sample_count * output_sample_rate - 1) / current_sample_rate + 1;
+@@ -220,16 +220,46 @@
+     } while (frame_number <= adhp->frame_count);
+     *start_offset = start_frame_pos - current_frame_pos;
+     if (*start_offset && current_sample_rate != output_sample_rate)
+-        *start_offset = (*start_offset * current_sample_rate - 1) / output_sample_rate + 1;
++        *start_offset = (start_frame_pos - prior_sequences_resampled_count) * current_sample_rate / output_sample_rate - input_frame_start;
+     if (frame_number > 1) {
+-        /* Add pre-roll samples if needed.
+-         * The condition is irresponsible. Patches welcome. */
+         enum AVCodecID codec_id = adhp->exh.entries[frame_list[frame_number].extradata_index].codec_id;
+         const AVCodecDescriptor* desc = avcodec_descriptor_get(codec_id);
+-        if ((desc->props & AV_CODEC_PROP_LOSSY) && frame_list[frame_number].extradata_index == frame_list[frame_number - 1].extradata_index)
+-            *start_offset += (uint64_t)frame_list[--frame_number].length;
++        int64_t preroll = adhp->ctx->seek_preroll;
++        if (codec_id == AV_CODEC_ID_OPUS)
++            preroll = FFMAX(preroll, av_rescale_rnd(80, current_sample_rate, 1000, AV_ROUND_UP));
++        else if (codec_id == AV_CODEC_ID_MP3) {
++            /* MPEG-1's bit reservoir holds at most 511 bytes. Include synthesis
++             * overlap in addition to the input needed to refill that reservoir. */
++            preroll = FFMAX(preroll, av_rescale_rnd(511 * 8, current_sample_rate,
++                FFMAX(adhp->ctx->bit_rate, 8000), AV_ROUND_UP) + 2 * frame_list[frame_number - 1].length);
++        }
++        if ((desc->props & AV_CODEC_PROP_LOSSY) || preroll > 0) {
++            uint64_t consumed = 0;
++            do {
++                if (frame_list[frame_number].extradata_index != frame_list[frame_number - 1].extradata_index)
++                    break;
++                int length = frame_list[--frame_number].length;
++                *start_offset += length;
++                consumed += length;
++            } while (frame_number > 1 && consumed < (uint64_t)preroll);
++        }
+     }
+     return frame_number;
++}
++
++static void apply_indexed_padding(lwlibav_audio_decode_handler_t* adhp, AVPacket* packet, uint32_t frame_number)
++{
++    if (frame_number != 1 && frame_number != adhp->frame_count && adhp->ctx->codec_id != AV_CODEC_ID_OPUS)
++        return;
++    size_t size = 0;
++    uint8_t* side = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
++    if (!side || size < 10)
++        side = av_packet_new_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, 10);
++    if (!side)
++        return;
++    memset(side, 0, 10);
++    AV_WL32(side, frame_number == 1 ? adhp->initial_padding : 0);
++    AV_WL32(side + 4, frame_number == adhp->frame_count ? adhp->trailing_padding : 0);
+ }
+ 
+ static inline void make_decodable_packet(AVPacket* alt_pkt, AVPacket* pkt)
+@@ -247,6 +277,21 @@
+         --rap_number;
+     if (rap_number == 0)
+         rap_number = 1;
++    /* Ogg indexes contain multiple packets at one page offset. Demuxer seeks
++     * identify pages, so anchor at the first indexed packet of that page. */
++    if (adhp->ctx->codec_id == AV_CODEC_ID_OPUS && !strcmp(adhp->format->iformat->name, "ogg")) {
++        while (rap_number > 1 && adhp->frame_list[rap_number].file_offset >= 0
++            && adhp->frame_list[rap_number - 1].file_offset == adhp->frame_list[rap_number].file_offset)
++            --rap_number;
++    }
++    if (adhp->ctx->codec_id == AV_CODEC_ID_OPUS && !strcmp(adhp->format->iformat->name, "ogg")
++        && rap_number > 1 && adhp->frame_list[rap_number].file_offset == adhp->frame_list[adhp->frame_count].file_offset) {
++        /* Enter the final Ogg page sequentially. Its EOS granule does not reset
++         * the demuxer's running DTS when seeking directly into that page. */
++        --rap_number;
++        while (rap_number > 1 && adhp->frame_list[rap_number - 1].file_offset == adhp->frame_list[rap_number].file_offset)
++            --rap_number;
++    }
+     return rap_number;
+ }
+ 
+@@ -364,6 +409,7 @@
+             }
+             match = 1;
+         }
++        apply_indexed_padding(adhp, pkt, i);
+         ++i;
+     }
+     return rap_number;
+@@ -408,6 +454,14 @@
+             aohp->request_length -= silence_length;
+             start_frame_pos = 0;
+         }
++        aohp->skip_decoded_samples = 0;
++        if (aohp->output_sample_rate != adhp->ctx->sample_rate && start_frame_pos > 0) {
++            uint64_t period = aohp->output_sample_rate / av_gcd(aohp->output_sample_rate, adhp->ctx->sample_rate);
++            uint64_t aligned = start_frame_pos / period * period;
++            aligned = aligned > period * 32 ? aligned - period * 32 : 0;
++            aohp->skip_decoded_samples = start_frame_pos - aligned;
++            start_frame_pos = aligned;
++        }
+         frame_number = find_start_audio_frame(adhp, aohp->output_sample_rate, start_frame_pos, &aohp->output_sample_offset);
+ retry_seek:
+         av_packet_unref(pkt);
+@@ -451,6 +505,7 @@
+         } else if (alter_pkt->size <= 0) {
+             /* Getting an audio packet must be after flushing all remaining samples in resampler's FIFO buffer. */
+             lwlibav_get_av_frame(adhp->format, adhp->stream_index, frame_number, pkt);
++            apply_indexed_padding(adhp, pkt, frame_number);
+             make_decodable_packet(alter_pkt, pkt);
+         }
+         /* Decode and output from an audio packet. */
+--- a/common/lwlibav_audio_internal.h
++++ b/common/lwlibav_audio_internal.h
+@@ -22,6 +22,7 @@
+ 
+ #ifndef LWLIBAV_AUDIO_INTERNAL_H
+ #define LWLIBAV_AUDIO_INTERNAL_H
++#define LSMAS_HOE_AUDIO_READ_CONTRACT 1
+ 
+ #include "lwlibav_dec.h"
+ 
+@@ -67,6 +68,8 @@
+     /* */
+     AVPacket packet; /* for getting and freeing */
+     AVPacket alter_packet; /* for consumed by the decoder instead of 'packet'. */
++    uint32_t initial_padding;
++    uint32_t trailing_padding;
+     uint32_t frame_length;
+     uint32_t last_frame_number;
+     uint64_t pcm_sample_count;
+--- a/common/resample.c
++++ b/common/resample.c
+@@ -86,14 +86,7 @@
+     int out_channels = get_channel_layout_nb_channels(out->channel_layout);
+     int block_align = av_get_bytes_per_sample(out->sample_format) * out_channels;
+     int request_sample_count = out->sample_count;
+-    if (swr_get_delay(swr, request_sample_count) > 0) {
+-        int resampled_count = swr_convert(swr, out->data, request_sample_count, NULL, 0);
+-        if (resampled_count < 0)
+-            return 0;
+-        request_sample_count -= resampled_count;
+-        *out->data += resampled_count * block_align;
+-    }
+-    uint8_t** in_data = in->sample_count > 0 ? in->data : NULL;
++    uint8_t** in_data = in->data;
+     const uint8_t** indata = (const uint8_t**)in_data;
+     int resampled_count = swr_convert(swr, out->data, request_sample_count, indata, in->sample_count);
+     if (resampled_count < 0)

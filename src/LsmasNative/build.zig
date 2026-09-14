@@ -41,7 +41,6 @@ pub fn build(b: *std.Build) void {
     });
 
     lib.root_module.addIncludePath(b.path("."));
-    lib.root_module.addIncludePath(.{ .cwd_relative = lsw_common_dir });
     lib.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ffmpeg_prefix, "include" }) });
 
     lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ffmpeg_prefix, "lib" }) });
@@ -54,10 +53,28 @@ pub fn build(b: *std.Build) void {
     const is_legacy_lsw = path_exists(io, legacy_xxhash_c);
     const is_hoe_lsw = path_exists(io, hoe_lwindex_utils_c);
 
+    var lsw_root: std.Build.LazyPath = .{ .cwd_relative = l_smash_works_dir };
+    if (is_hoe_lsw and !is_legacy_lsw) {
+        const python = b.option([]const u8, "python", "Python used to prepare the private audio dependency") orelse
+            (if (@import("builtin").os.tag == .windows) "python" else "python3");
+        const prepare = b.addSystemCommand(&.{python});
+        // Directory arguments are not content-hashed by Run. Refresh the private
+        // copy on every build so changing the dependency checkout cannot reuse stale code.
+        prepare.has_side_effects = true;
+        prepare.addFileArg(b.path("../../scripts/prepare_audio_dependency.py"));
+        prepare.addArg("--source");
+        prepare.addDirectoryArg(.{ .cwd_relative = l_smash_works_dir });
+        prepare.addArg("--patch");
+        prepare.addFileArg(b.path("patches/hoe-audio-read-contract.patch"));
+        prepare.addArg("--output");
+        lsw_root = prepare.addOutputDirectoryArg("lsmas-audio-contract");
+    }
+    lib.root_module.addIncludePath(lsw_root.path(b, "common"));
+
     if (is_hoe_lsw and !is_legacy_lsw) {
         lib.root_module.addCMacro("LSMAS_LSW_VARIANT_HOE", "1");
         // HOE's common/ expects <xxhash.h> and does not ship xxhash.{c,h} inside common/.
-        lib.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ l_smash_works_dir, "xxHash" }) });
+        lib.root_module.addIncludePath(lsw_root.path(b, "xxHash"));
     } else {
         lib.root_module.addCMacro("LSMAS_LSW_VARIANT_HOE", "0");
     }
@@ -103,7 +120,7 @@ pub fn build(b: *std.Build) void {
     var sources = std.ArrayList([]const u8).empty;
     defer sources.deinit(b.allocator);
 
-    sources.append(b.allocator, "lsmas_native.c") catch @panic("OOM");
+    lib.root_module.addCSourceFile(.{ .file = b.path("lsmas_native.c"), .flags = &.{ "-DXXH_INLINE_ALL", "-Wno-deprecated-declarations" } });
 
     const common_sources = [_][]const u8{
         "utils.c",
@@ -118,7 +135,7 @@ pub fn build(b: *std.Build) void {
         "resample.c",
     };
     inline for (common_sources) |name| {
-        sources.append(b.allocator, b.pathJoin(&.{ lsw_common_dir, name })) catch @panic("OOM");
+        sources.append(b.allocator, b.pathJoin(&.{ "common", name })) catch @panic("OOM");
     }
     const optional_common_sources = [_][]const u8{
         "qsv.c",
@@ -126,13 +143,13 @@ pub fn build(b: *std.Build) void {
     inline for (optional_common_sources) |name| {
         const p = b.pathJoin(&.{ lsw_common_dir, name });
         if (path_exists(io, p)) {
-            sources.append(b.allocator, p) catch @panic("OOM");
+            sources.append(b.allocator, b.pathJoin(&.{ "common", name })) catch @panic("OOM");
         }
     }
 
     if (is_legacy_lsw) {
         // Legacy common/ ships xxhash.{c,h} and xxh3.h.
-        sources.append(b.allocator, legacy_xxhash_c) catch @panic("OOM");
+        sources.append(b.allocator, "common/xxhash.c") catch @panic("OOM");
     } else if (is_hoe_lsw) {
         // HOE common/ splits index helpers into separate translation units.
         const hoe_extra = [_][]const u8{
@@ -143,13 +160,13 @@ pub fn build(b: *std.Build) void {
         inline for (hoe_extra) |name| {
             const p = b.pathJoin(&.{ lsw_common_dir, name });
             if (path_exists(io, p)) {
-                sources.append(b.allocator, p) catch @panic("OOM");
+                sources.append(b.allocator, b.pathJoin(&.{ "common", name })) catch @panic("OOM");
             }
         }
         // Provide xxhash implementation expected by <xxhash.h> calls.
         const xxhash_impl = b.pathJoin(&.{ l_smash_works_dir, "xxHash", "xxhash.c" });
         if (path_exists(io, xxhash_impl)) {
-            sources.append(b.allocator, xxhash_impl) catch @panic("OOM");
+            sources.append(b.allocator, "xxHash/xxhash.c") catch @panic("OOM");
         } else {
             std.log.err("HOE L-SMASH-Works detected, but missing xxHash/xxhash.c under: {s}", .{l_smash_works_dir});
             @panic("Missing xxHash/xxhash.c for HOE variant.");
@@ -160,7 +177,7 @@ pub fn build(b: *std.Build) void {
         @panic("Unknown L-SMASH-Works common/ variant.");
     }
 
-    lib.root_module.addCSourceFiles(.{ .files = sources.items, .flags = &.{ "-DXXH_INLINE_ALL", "-Wno-deprecated-declarations" } });
+    lib.root_module.addCSourceFiles(.{ .root = lsw_root, .files = sources.items, .flags = &.{ "-DXXH_INLINE_ALL", "-Wno-deprecated-declarations" } });
 
     const prefer_static_ffmpeg = b.option(bool, "ffmpeg_static", "Prefer linking FFmpeg libraries statically into lsmasnative.dll") orelse true;
     if (prefer_static_ffmpeg) {

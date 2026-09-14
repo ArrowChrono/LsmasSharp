@@ -18,6 +18,7 @@
 #include <libavutil/display.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
+#include <libavutil/intreadwrite.h>
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 61, 100)
 #include <libavutil/film_grain_params.h>
 #endif
@@ -163,6 +164,7 @@ struct lsmas_handle_t
     lsmas_video_info_t info;
     lsmas_audio_info_t audio_info;
     int audio_info_valid;
+    int audio_sync_to_video;
     char *last_error;
 #ifdef _WIN32
     CRITICAL_SECTION error_lock;
@@ -524,7 +526,11 @@ static int sbuf_append_version_triplet_from_u32( sbuf_t *b, uint32_t v )
 
 LSMAS_NATIVE_API int32_t lsmas_get_api_version( void )
 {
+#if LSMAS_LSW_VARIANT_HOE
     return (int32_t)LSMAS_NATIVE_API_VERSION;
+#else
+    return (int32_t)LSMAS_NATIVE_MAKE_API_VERSION(1, 1, 0);
+#endif
 }
 
 LSMAS_NATIVE_API char *lsmas_get_versions_json_utf8( char **error_message )
@@ -550,7 +556,7 @@ LSMAS_NATIVE_API char *lsmas_get_versions_json_utf8( char **error_message )
 
     if( APPEND_LIT( &b, ",\"api_version_string\":" ) != 0 )
         goto oom;
-    if( sbuf_append_json_escaped( &b, LSMAS_NATIVE_API_VERSION_STRING ) != 0 )
+    if( sbuf_append_json_escaped( &b, LSMAS_LSW_VARIANT_HOE ? LSMAS_NATIVE_API_VERSION_STRING : "1.1.0" ) != 0 )
         goto oom;
 
     if( APPEND_LIT( &b, ",\"zig_version\":" ) != 0 )
@@ -1478,6 +1484,183 @@ static enum AVSampleFormat map_audio_sample_format( lsmas_audio_sample_format_t 
     }
 }
 
+/* Count the resampler's real EOF output rather than independently rounding
+ * every coded frame. Integral resampling periods contribute exactly; only a
+ * bounded suffix, including filter warmup, needs to pass through swresample. */
+static int64_t resampled_audio_length( int64_t input_count, int input_rate, int output_rate )
+{
+#if LSMAS_LSW_VARIANT_HOE
+    if( input_rate <= 0 || output_rate <= 0 || input_count < 0 )
+        return -1;
+    if( input_rate == output_rate || input_count == 0 )
+        return input_count;
+    int64_t input_period = input_rate / av_gcd( input_rate, output_rate );
+    int64_t output_period = output_rate / av_gcd( input_rate, output_rate );
+    int64_t warmup = av_rescale_rnd( 256, FFMAX( input_rate, output_rate ), output_rate, AV_ROUND_UP );
+    int64_t warmup_periods = (warmup + input_period - 1) / input_period;
+    int64_t omitted = FFMAX( 0, input_count / input_period - warmup_periods );
+    int probe_count = (int)(input_count - omitted * input_period);
+    int64_t capacity64 = av_rescale_rnd( probe_count, output_rate, input_rate, AV_ROUND_UP ) + 256;
+    if( capacity64 > INT_MAX )
+        return -1;
+    SwrContext *swr = NULL;
+    AVChannelLayout mono = AV_CHANNEL_LAYOUT_MONO;
+    if( swr_alloc_set_opts2( &swr, &mono, AV_SAMPLE_FMT_FLT, output_rate,
+                            &mono, AV_SAMPLE_FMT_FLT, input_rate, 0, NULL ) < 0 || swr_init( swr ) < 0 )
+    {
+        swr_free( &swr );
+        return -1;
+    }
+    float *input = av_calloc( probe_count, sizeof(float) );
+    float *output = av_malloc_array( (size_t)capacity64, sizeof(float) );
+    if( !input || !output )
+    {
+        av_free( input );
+        av_free( output );
+        swr_free( &swr );
+        return -1;
+    }
+    const uint8_t *in = (const uint8_t *)input;
+    uint8_t *out = (uint8_t *)output;
+    int64_t count = swr_convert( swr, &out, (int)capacity64, &in, probe_count );
+    if( count >= 0 )
+    {
+        int drained;
+        do
+        {
+            drained = swr_convert( swr, &out, (int)capacity64, NULL, 0 );
+            if( drained < 0 )
+            {
+                count = -1;
+                break;
+            }
+            count += drained;
+        } while( drained > 0 );
+    }
+    av_free( input );
+    av_free( output );
+    swr_free( &swr );
+    return count < 0 ? -1 : omitted * output_period + count;
+#else
+    return av_rescale_rnd( input_count, output_rate, input_rate, AV_ROUND_UP );
+#endif
+}
+
+static int64_t count_decoded_audio_samples( lsmas_handle_t *h )
+{
+#if LSMAS_LSW_VARIANT_HOE
+    lwlibav_audio_decode_handler_t *adhp = h->adhp;
+    int rate = adhp->ctx->sample_rate;
+    int64_t input_count = 0;
+    int64_t output_count = 0;
+    for( uint32_t i = 1; i <= adhp->frame_count + 1; ++i )
+    {
+        int next_rate = i <= adhp->frame_count ? adhp->frame_list[i].sample_rate : 0;
+        if( i > adhp->frame_count || (next_rate > 0 && next_rate != rate) )
+        {
+            int64_t count = resampled_audio_length( input_count, rate, h->aohp->output_sample_rate );
+            if( count < 0 )
+                return -1;
+            output_count += count;
+            input_count = 0;
+            rate = next_rate;
+        }
+        if( i <= adhp->frame_count )
+            input_count += adhp->frame_list[i].length;
+    }
+    adhp->pcm_sample_count = output_count;
+    return output_count;
+#else
+    return (int64_t)lwlibav_audio_count_overall_pcm_samples( h->adhp, h->aohp->output_sample_rate );
+#endif
+}
+
+/* The index counts coded frame samples; libavcodec removes packet-declared
+ * encoder priming and trailing padding before exposing decoded frames. Keep
+ * the seek index on that same decoded timeline, including cached old indexes. */
+static int trim_audio_index_padding( lsmas_handle_t *h )
+{
+#if LSMAS_LSW_VARIANT_HOE
+#ifndef LSMAS_HOE_AUDIO_READ_CONTRACT
+#error HOE builds require the audio read contract dependency patch
+#endif
+    lwlibav_audio_decode_handler_t *adhp = h->adhp;
+    for( int tail = 0; tail < 2; ++tail )
+    {
+        uint32_t number = tail ? adhp->frame_count : 1;
+        audio_frame_info_t *target = &adhp->frame_list[number];
+        int64_t timestamp = target->pts != AV_NOPTS_VALUE ? target->pts : target->dts;
+        int flags = AVSEEK_FLAG_BACKWARD;
+        if( timestamp == AV_NOPTS_VALUE )
+        {
+            timestamp = target->file_offset;
+            flags |= AVSEEK_FLAG_BYTE;
+        }
+        if( timestamp < 0 && (flags & AVSEEK_FLAG_BYTE) )
+            return 0;
+        if( av_seek_frame( adhp->format, adhp->stream_index, timestamp, flags ) < 0 )
+            return -1;
+        AVPacket *packet = av_packet_alloc();
+        if( !packet )
+            return -1;
+        int matched = 0;
+        while( av_read_frame( adhp->format, packet ) >= 0 )
+        {
+            if( packet->stream_index == adhp->stream_index
+                && ((target->pts != AV_NOPTS_VALUE && packet->pts == target->pts)
+                    || (target->pts == AV_NOPTS_VALUE && target->dts != AV_NOPTS_VALUE && packet->dts == target->dts)
+                    || (target->pts == AV_NOPTS_VALUE && target->dts == AV_NOPTS_VALUE && packet->pos == target->file_offset)) )
+            {
+                size_t size = 0;
+                uint8_t *side = av_packet_get_side_data( packet, AV_PKT_DATA_SKIP_SAMPLES, &size );
+                uint32_t skip = size >= 10 ? AV_RL32( side + (tail ? 4 : 0) ) : 0;
+                if( adhp->ctx->codec_id == AV_CODEC_ID_OPUS )
+                {
+                    if( !tail )
+                        skip = FFMAX( skip, (uint32_t)adhp->ctx->initial_padding );
+                    else if( size < 10 && packet->duration > 0 )
+                    {
+                        int64_t duration = av_rescale_q( packet->duration, adhp->time_base, (AVRational){ 1, target->sample_rate } );
+                        AVStream *stream = adhp->format->streams[adhp->stream_index];
+                        if( !strcmp( adhp->format->iformat->name, "ogg" ) && stream->duration > 0 )
+                        {
+                            int64_t declared = av_rescale_q( stream->duration, stream->time_base, (AVRational){ 1, target->sample_rate } ) - adhp->ctx->initial_padding;
+                            int64_t indexed = 0;
+                            for( uint32_t i = 1; i <= adhp->frame_count; ++i )
+                                indexed += adhp->frame_list[i].length;
+                            if( indexed > declared && indexed - declared <= target->length )
+                                duration = target->length - (indexed - declared);
+                        }
+                        if( duration < target->length )
+                            skip = target->length - duration;
+                    }
+                }
+                if( tail ) adhp->trailing_padding = skip;
+                else adhp->initial_padding = skip;
+                for( uint32_t i = number; skip && i >= 1 && i <= adhp->frame_count; tail ? --i : ++i )
+                {
+                    uint32_t amount = FFMIN( skip, (uint32_t)adhp->frame_list[i].length );
+                    adhp->frame_list[i].length -= amount;
+                    skip -= amount;
+                }
+                matched = skip == 0;
+                break;
+            }
+            av_packet_unref( packet );
+        }
+        av_packet_free( &packet );
+        if( !matched )
+            return -1;
+    }
+    if( h->audio_sync_to_video )
+        h->lwh.av_gap += adhp->initial_padding;
+    return 0;
+#else
+    (void)h;
+    return 0;
+#endif
+}
+
 static int setup_audio_rendering( lsmas_handle_t *h, const lsmas_audio_open_options_t *opt_in )
 {
     if( !h || !h->adhp || !h->aohp )
@@ -1589,6 +1772,8 @@ static int setup_audio_rendering( lsmas_handle_t *h, const lsmas_audio_open_opti
 
 static int init_audio_provider_on_handle( lsmas_handle_t *h, const lsmas_audio_open_options_t *opt_in, char **error_message )
 {
+    if( h )
+        h->audio_sync_to_video = opt_in && opt_in->av_sync && h->vdhp && h->vdhp->frame_count > 0;
     if( !h || !h->adhp || !h->aohp )
     {
         set_error_message( error_message, "Invalid handle state (audio handlers missing)." );
@@ -1619,8 +1804,13 @@ static int init_audio_provider_on_handle( lsmas_handle_t *h, const lsmas_audio_o
     }
 
     AVCodecContext *ctx = lwlibav_audio_get_codec_context( h->adhp );
-    uint64_t decoded_samples = lwlibav_audio_count_overall_pcm_samples( h->adhp, h->aohp->output_sample_rate );
-    if( decoded_samples == 0 )
+    if( trim_audio_index_padding( h ) < 0 )
+    {
+        set_error_message( error_message, "Failed to read indexed audio boundary packets." );
+        return -1;
+    }
+    int64_t decoded_samples = count_decoded_audio_samples( h );
+    if( decoded_samples <= 0 )
     {
         set_error_message( error_message, "No valid audio frame." );
         return -1;
@@ -2301,6 +2491,7 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_audio_open_utf8(
         return NULL;
     }
 
+    h->audio_sync_to_video = opt_in.av_sync && h->vdhp && h->vdhp->frame_count > 0;
     /* Audio-only handle: release video handlers after av_gap/index construction. */
     lwlibav_video_free_decode_handler_ptr( &h->vdhp );
     lwlibav_video_free_output_handler_ptr( &h->vohp );
@@ -2332,8 +2523,14 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_audio_open_utf8(
     }
 
     AVCodecContext *ctx = lwlibav_audio_get_codec_context( h->adhp );
-    uint64_t decoded_samples = lwlibav_audio_count_overall_pcm_samples( h->adhp, h->aohp->output_sample_rate );
-    if( decoded_samples == 0 )
+    if( trim_audio_index_padding( h ) < 0 )
+    {
+        set_error_message( error_message, "Failed to read indexed audio boundary packets." );
+        lsmas_video_close( h );
+        return NULL;
+    }
+    int64_t decoded_samples = count_decoded_audio_samples( h );
+    if( decoded_samples <= 0 )
     {
         set_error_message( error_message, "No valid audio frame." );
         lsmas_video_close( h );
@@ -2510,15 +2707,13 @@ LSMAS_NATIVE_API int64_t lsmas_audio_get_samples(
     else if( readable > 0 )
     {
         int64_t decode_start = start - audio_delay;
-        int64_t written = (int64_t)lwlibav_audio_get_pcm_samples( handle->adhp, handle->aohp, outp, decode_start, readable );
-        if( written < 0 )
-            written = 0;
-        if( written < readable )
+        uint64_t written = lwlibav_audio_get_pcm_samples( handle->adhp, handle->aohp, outp, decode_start, readable );
+        if( written != (uint64_t)readable )
         {
-            /* Defensive: fill remaining with silence. */
-            memset( outp + written * handle->aohp->output_block_align,
-                    silence,
-                    (size_t)((readable - written) * handle->aohp->output_block_align) );
+            /* Silence is only valid outside the decoded timeline, not after a failed read. */
+            lwlibav_audio_force_seek( handle->adhp );
+            set_error_message( error_message, handle->last_error ? handle->last_error : "Failed to decode the complete requested audio range." );
+            return -1;
         }
         outp += readable * handle->aohp->output_block_align;
     }
