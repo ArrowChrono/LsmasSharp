@@ -1955,7 +1955,9 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_video_open_utf8(
     opt.force_video_index = (opt_in.stream_index >= 0) ? opt_in.stream_index : -1;
     opt.force_audio       = 0;
     opt.force_audio_index = -2;
-    opt.apply_repeat_flag = opt_in.repeat ? 1 : 0;
+    /* Preserve mode 2 (best effort); keep legacy nonzero values strict. */
+    const int requested_repeat_mode = opt_in.repeat == 2 ? 2 : (opt_in.repeat ? 1 : 0);
+    opt.apply_repeat_flag = requested_repeat_mode;
     opt.field_dominance   = (int)CLIP_VALUE( opt_in.dominance, 0, 2 );
     opt.vfr2cfr.active    = (opt_in.fpsnum > 0 && opt_in.fpsden > 0) ? 1 : 0;
     opt.vfr2cfr.fps_num   = (uint32_t)opt_in.fpsnum;
@@ -1985,7 +1987,7 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_video_open_utf8(
 
     /* Eliminate silent failure: if repeat=1, then fail if repeat is requested but not applied.
        This matches VapourSynth/LWLibavSource behavior. */
-    if( opt.apply_repeat_flag == 1 )
+    if( requested_repeat_mode == 1 && !opt.vfr2cfr.active )
     {
         if( h->vohp->repeat_requested && !h->vohp->repeat_control )
         {
@@ -2221,7 +2223,9 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_av_open_utf8(
     opt.force_video_index = (vopt_in.stream_index >= 0) ? vopt_in.stream_index : -1;
     opt.force_audio       = (aopt_in.stream_index >= 0);
     opt.force_audio_index = (aopt_in.stream_index >= 0) ? aopt_in.stream_index : -1;
-    opt.apply_repeat_flag = vopt_in.repeat ? 1 : 0;
+    /* Preserve mode 2 (best effort); keep legacy nonzero values strict. */
+    const int requested_repeat_mode = vopt_in.repeat == 2 ? 2 : (vopt_in.repeat ? 1 : 0);
+    opt.apply_repeat_flag = requested_repeat_mode;
     opt.field_dominance   = (int)CLIP_VALUE( vopt_in.dominance, 0, 2 );
     opt.vfr2cfr.active    = (vopt_in.fpsnum > 0 && vopt_in.fpsden > 0) ? 1 : 0;
     opt.vfr2cfr.fps_num   = (uint32_t)vopt_in.fpsnum;
@@ -2267,7 +2271,7 @@ LSMAS_NATIVE_API lsmas_handle_t *lsmas_av_open_utf8(
         return NULL;
     }
 
-    if( opt.apply_repeat_flag == 1 )
+    if( requested_repeat_mode == 1 && !opt.vfr2cfr.active )
     {
         if( h->vohp->repeat_requested && !h->vohp->repeat_control )
         {
