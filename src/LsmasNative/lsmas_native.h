@@ -89,7 +89,7 @@ typedef struct lsmas_video_open_options_t
     /* Reserved for ABI compatibility (not used in LWLibav-only mode). */
     int32_t framelist;           /* 0/1 */
 
-    int32_t repeat;              /* 0/1 */
+    int32_t repeat;              /* 0=off, 1=strict, 2=best effort */
     lsmas_field_dominance_t dominance;
 } lsmas_video_open_options_t;
 
