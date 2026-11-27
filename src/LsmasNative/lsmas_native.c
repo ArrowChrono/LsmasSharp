@@ -1412,10 +1412,10 @@ static int has_repeat_duplicates( const lwlibav_video_output_handler_t *vohp )
     return 0;
 }
 
-static int64_t calc_cfr_delta_pts( AVRational time_base, int64_t fps_num, int64_t fps_den )
+static int64_t calc_cfr_offset_pts( AVRational time_base, int64_t fps_num, int64_t fps_den, uint32_t frame_index )
 {
-    if( time_base.num == 0 || time_base.den == 0 || fps_num <= 0 || fps_den <= 0 )
-        return 1;
+    if( time_base.num <= 0 || time_base.den <= 0 || fps_num <= 0 || fps_den <= 0 )
+        return frame_index;
 
     if( fps_num > INT_MAX )
         fps_num = INT_MAX;
@@ -1423,10 +1423,9 @@ static int64_t calc_cfr_delta_pts( AVRational time_base, int64_t fps_num, int64_
         fps_den = INT_MAX;
 
     AVRational frame_duration = { (int)fps_den, (int)fps_num }; /* seconds per frame */
-    int64_t delta = av_rescale_q_rnd( 1, frame_duration, time_base, AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX );
-    if( delta <= 0 )
-        return 1;
-    return delta;
+    /* Round the whole elapsed interval, not a single frame's duration.
+       A coarse time base may legitimately map adjacent frames to the same tick. */
+    return av_rescale_q_rnd( frame_index, frame_duration, time_base, AV_ROUND_NEAR_INF );
 }
 
 static int64_t get_video_output_pts( const lsmas_handle_t *h, uint32_t output_frame_number )
@@ -1441,8 +1440,7 @@ static int64_t get_video_output_pts( const lsmas_handle_t *h, uint32_t output_fr
     if( vohp->vfr2cfr )
     {
         int64_t base_ts = (vdhp->min_ts != AV_NOPTS_VALUE) ? vdhp->min_ts : 0;
-        int64_t delta = calc_cfr_delta_pts( vdhp->time_base, (int64_t)vohp->cfr_num, (int64_t)vohp->cfr_den );
-        return base_ts + (int64_t)(output_frame_number - 1) * delta;
+        return base_ts + calc_cfr_offset_pts( vdhp->time_base, (int64_t)vohp->cfr_num, (int64_t)vohp->cfr_den, output_frame_number - 1 );
     }
 
     if( vohp->repeat_control && has_repeat_duplicates( vohp ) )
@@ -1450,8 +1448,7 @@ static int64_t get_video_output_pts( const lsmas_handle_t *h, uint32_t output_fr
         /* Repeat control duplicates pictures/fields; output timeline is effectively CFR. */
         int64_t base_ts = (vdhp->min_ts != AV_NOPTS_VALUE) ? vdhp->min_ts
                       : (vdhp->frame_count >= 1 ? vdhp->frame_list[1].pts : 0);
-        int64_t delta = calc_cfr_delta_pts( vdhp->time_base, (int64_t)h->info.fps_num, (int64_t)h->info.fps_den );
-        return base_ts + (int64_t)(output_frame_number - 1) * delta;
+        return base_ts + calc_cfr_offset_pts( vdhp->time_base, (int64_t)h->info.fps_num, (int64_t)h->info.fps_den, output_frame_number - 1 );
     }
 
     if( vohp->repeat_control && vohp->frame_order_list )
